@@ -1,3 +1,4 @@
+"""
 maritime.py — AIS decoder & vessel telemetry view for PAR AVION.
 
 AIS (Automatic Identification System) is broadcast in the clear on marine
