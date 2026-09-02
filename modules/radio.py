@@ -1,3 +1,4 @@
+"""
 radio.py — CLI spectrum waterfall analyzer for PAR AVION.
 
 Reads raw IQ samples from an RTL-SDR via pyrtlsdr, computes an FFT power
