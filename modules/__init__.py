@@ -1,3 +1,4 @@
+"""
 PAR AVION — Tactical RF & Telemetry Suite
 Modules package: hardware detection, radar UI primitives, and the four
 operational modes (airplanes, radio, maritime, iss).
