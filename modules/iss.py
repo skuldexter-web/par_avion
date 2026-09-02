@@ -1,4 +1,3 @@
-"""
 iss.py — ISS TLE satellite tracking & pass predictor for PAR AVION.
 
 Downloads current NORAD two-line element (TLE) data for the ISS from
