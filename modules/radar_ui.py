@@ -1,4 +1,3 @@
-"""
 radar_ui.py — Shared curses rendering primitives for PAR AVION.
 
 Provides:
