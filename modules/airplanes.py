@@ -1,3 +1,4 @@
+"""
 airplanes.py — Dump1090 daemon controller & ADS-B decoder for PAR AVION.
 
 Spawns/manages a background dump1090 process (or connects to one already
