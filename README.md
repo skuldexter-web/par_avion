@@ -24,7 +24,7 @@ on any RF interface.
 ## Installation
 
 ```bash
-git clone https://github.com/skuldexter-web/par_avion.git
+git clone <this-repo>
 cd par_avion
 chmod +x install.sh
 ./install.sh
@@ -76,12 +76,24 @@ explorable; Airplanes/Maritime will show "no feed" until a receiver
 | Main menu | `1`–`4` | Enter a mode |
 | Main menu | `Q` | Quit |
 | Any mode | `Q` / `Esc` | Return to main menu |
-| Airplanes | — | Auto-refreshing radar + table, no interaction needed |
+| Airplanes | `S` | Start/restart dump1090 (also shows why it isn't running) |
 | Radio | `←` / `→` | Tune ±100 kHz |
 | Radio | `Shift+←` / `Shift+→` | Fine-tune ±10 kHz |
 | Radio | `↑` / `↓` | Cycle band presets (433 MHz ISM, FM, Airband, 2m/70cm HAM, 315 MHz) |
-| Maritime | — | Auto-refreshing radar + vessel table |
+| Maritime | `S` | Restart rtl_ais |
 | ISS | `R` | Force TLE refresh from CelesTrak |
+
+Airplanes and Maritime both show a live status line explaining exactly
+why there's no feed (binary not found, process exited, port in use,
+etc.) rather than a bare "no data" — press `S` to retry after fixing
+whatever it reports.
+
+**Note on running dump1090 yourself:** if you'd rather manage dump1090
+in its own terminal (e.g. to also watch its own `--interactive` view),
+make sure to include `--net --raw` so PAR AVION can connect to it:
+`dump1090 --interactive --net --raw`. A plain `dump1090 --interactive`
+with no networking flags won't open the port PAR AVION connects to, and
+PAR AVION will spawn its own instance instead (or report why it can't).
 
 ## Module Overview
 
@@ -106,6 +118,27 @@ par_avion/
 - **dump1090/rtl_ais won't start** — these are spawned as background
   subprocesses; if the binaries aren't on your `PATH`, install them manually
   or re-run `install.sh`, which builds them from source as a fallback.
+  Airplanes/Maritime mode's status line will say exactly why (binary not
+  found, exited immediately, port already in use) — press `S` to retry.
+- **apt says a package "has no installation candidate"** — Kali's package
+  set changes over time; `install.sh` checks for a real installable
+  candidate before trying `dump1090-mutability`/`dump1090-fa` and falls
+  back to building from source automatically, so this shouldn't block
+  installation, just add a minute or two while it compiles.
+- **`pip install pyrtlsdr` works but Radio mode won't go LIVE** —
+  apt's `librtlsdr` on Kali is often older than what recent `pyrtlsdr`
+  releases expect (missing symbols like `rtlsdr_set_dithering`).
+  `requirements.txt` pins `pyrtlsdr==0.2.93` for compatibility; if you've
+  built a newer `librtlsdr` from source (osmocom/rtl-sdr), you can use a
+  newer `pyrtlsdr` too.
+- **`ModuleNotFoundError` for `pyModeS.adsb`** — pyModeS v3 removed the
+  function-per-field API this app uses. `requirements.txt` pins
+  `pyModeS<3,>=2.13`; if you installed pyModeS separately, run
+  `pip3 install "pyModeS<3,>=2.13" --break-system-packages --force-reinstall`.
+- **Started dump1090 manually and PAR AVION still says NOT RUNNING** —
+  make sure you passed `--net --raw` (e.g.
+  `dump1090 --interactive --net --raw`). A plain `--interactive` instance
+  doesn't open the network port PAR AVION connects to.
 - **No GPS fix** — modes fall back to `0,0` as the radar center. Run
   `gpsd -N -D 5 /dev/ttyUSB0` (adjust device) in a separate terminal to
   debug a GPS dongle directly.

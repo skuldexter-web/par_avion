@@ -1,0 +1,21 @@
+# PAR AVION — Python dependencies
+# Install with: pip3 install -r requirements.txt --break-system-packages
+
+pyrtlsdr==0.2.93        # RTL-SDR hardware interface — pinned: apt's librtlsdr
+                        # (2.0.2 on Kali) predates symbols pyrtlsdr>=0.3.0
+                        # expects (e.g. rtlsdr_set_dithering). If you build a
+                        # newer librtlsdr from source (osmocom/rtl-sdr), you
+                        # can bump this back to >=0.3.0.
+gpsd-py3>=0.3.0        # GPSD client for GPS dongle auto-location
+pyserial>=3.5          # Serial fallback for /dev/ttyUSB* GPS devices
+requests>=2.31.0       # TLE downloads (ISS tracking), AIS feed HTTP fallback
+skyfield>=1.47         # Orbital mechanics / TLE propagation for ISS tracking
+numpy>=1.26.0          # FFT / signal processing for waterfall display
+pyModeS<3,>=2.13       # ADS-B Mode S message decoding. Pinned below v3:
+                        # v3 removed the pms.adsb.* function-per-field API
+                        # (icao/typecode/callsign/altitude/velocity/oe_flag/
+                        # position) that this app's ADS-B decoding is built
+                        # on, replacing it with a single decode() call.
+
+# Note: 'curses' is part of the Python standard library on Linux and is NOT
+# installed via pip. Do not add it here — it will fail on Debian/Kali.
