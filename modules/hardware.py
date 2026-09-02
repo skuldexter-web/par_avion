@@ -1,4 +1,3 @@
-"""
 hardware.py — Hardware auto-detection for PAR AVION.
 
 Detects connected SDR devices (RTL-SDR v3/v4, HackRF One, Nooelec variants)
