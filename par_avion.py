@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-PAR AVION — Tactical RF & Telemetry Suite
+PAR AVION — Tactical RF & Telemetry Suite v2.0
 Main CLI entry point and TUI engine.
 
 Usage:
     python3 par_avion.py
 
-A cyberpunk-styled curses menu that dispatches into one of four modes:
-  1) Airplanes — ADS-B 1090MHz decode via dump1090, green radar + map
-  2) Radio     — RTL-SDR spectrum waterfall, live band tuning
-  3) Maritime  — AIS vessel tracking via rtl_ais
-  4) ISS       — NORAD TLE orbit propagation + pass predictor
+A cyberpunk-styled curses menu that dispatches into one of seven modes:
+  1) Airplanes  — ADS-B 1090MHz decode via dump1090, tactical radar + map
+  2) Waterfalls — RTL-SDR spectrum analyzer, rolling ASCII waterfall
+  3) Radio      — Broadcast AM/FM audio demodulator & tuner
+  4) Maritime   — AIS vessel tracking via rtl_ais, tactical marine radar
+  5) ISS        — NORAD TLE orbit propagation + pass predictor
+  6) SSTV       — Slow Scan TV image decoder (Martin/Scottie/Robot)
+  7) Morse      — CW/Morse code audio decoder & visualizer
 
 All operational modes are receive-only: they decode signals that are
-already broadcast in the clear (ADS-B, AIS, published TLE data) and
-render them locally. No mode transmits on any RF interface.
+already broadcast in the clear (ADS-B, AIS, published TLE data, amateur
+SSTV/CW transmissions on their conventional calling frequencies) and
+render/demodulate them locally. No mode transmits on any RF interface.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ import sys
 # can be bypassed by some launchers/wrappers.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from modules import airplanes, hardware, iss, maritime, radar_ui, radio
+from modules import airplanes, hardware, iss, maritime, morse, radar_ui, radio, sstv, waterfall
 
 BANNER = [
     r" ██▓███   ▄▄▄       ██▀███      ▄▄▄       ██▒   █▓ ██▓ ▒█████   ███▄    █ ",
@@ -43,13 +47,16 @@ BANNER = [
     r"              ░  ░   ░              ░  ░       ░   ░      ░ ░           ░ ",
 ]
 
-TAGLINE = "— Tactical RF & Telemetry Suite —"
+TAGLINE = "— Tactical RF & Telemetry Suite v2.0 —"
 
 MENU_ITEMS = [
-    ("1", "Airplanes", "ADS-B 1090MHz + Green Radar"),
-    ("2", "Radio", "Spectrum Analyzer & Waterfall Display"),
-    ("3", "Maritime", "AIS 161.975MHz / 162.025MHz Vessel Tracking"),
-    ("4", "ISS", "ISS Satellite Real-time Orbit & Radar Pass"),
+    ("1", "Airplanes", "ADS-B 1090MHz + Dynamic Tactical Radar"),
+    ("2", "Waterfalls", "Spectrum Analyzer & Rolling ASCII Waterfall"),
+    ("3", "Radio", "Broadcast AM/FM Audio Demodulator & Tuner"),
+    ("4", "Maritime", "AIS Vessel Tracking + Tactical Marine Radar"),
+    ("5", "ISS", "ISS Orbit Pass Predictor & Spinning Globe"),
+    ("6", "SSTV", "Slow Scan TV Decoder: Martin, Scottie, Robot"),
+    ("7", "Morse", "CW / Morse Code Audio Decoder & Visualizer"),
     ("Q", "Quit", ""),
 ]
 
@@ -70,10 +77,10 @@ def draw_menu(stdscr, hw_report, gps_lat, gps_lon) -> None:
     banner_win.noutrefresh()
 
     menu_top = banner_win_h + 2
-    divider = "=" * min(width - 2, 50)
+    divider = "=" * min(width - 2, 54)
     menu_x = max(0, (width - len(divider)) // 2)
 
-    lines = [divider, "  PAR AVION — Tactical RF & Telemetry Suite", divider]
+    lines = [divider, "  PAR AVION — Tactical RF & Telemetry Suite v2.0", divider]
     for key, label, desc in MENU_ITEMS:
         if desc:
             lines.append(f"  [ {key} ] {label:<10} ({desc})")
@@ -93,7 +100,10 @@ def draw_menu(stdscr, hw_report, gps_lat, gps_lon) -> None:
     # Hardware status footer
     status_y = min(height - 3, menu_top + len(lines) + 1)
     sdr_status = f"SDR: {len(hw_report.sdrs)} detected" if hw_report.sdrs else "SDR: NONE DETECTED"
-    gps_status = f"GPS: {gps_lat:.4f},{gps_lon:.4f}" if hw_report.gps and hw_report.gps.fix else "GPS: NO FIX (using fallback 0,0)"
+    if gps_lat is not None and gps_lon is not None:
+        gps_status = f"GPS: {gps_lat:.4f},{gps_lon:.4f}"
+    else:
+        gps_status = "GPS: NO FIX (radar modes will use relative spatial estimation)"
     try:
         stdscr.addstr(status_y, menu_x, sdr_status, curses.color_pair(radar_ui.PAIR_YELLOW))
         stdscr.addstr(status_y + 1, menu_x, gps_status, curses.color_pair(radar_ui.PAIR_YELLOW))
@@ -119,7 +129,7 @@ def main(stdscr) -> None:
     radar_ui.init_colors()
 
     hw_report = hardware.full_report()
-    gps_lat, gps_lon = 0.0, 0.0
+    gps_lat, gps_lon = None, None
     if hw_report.gps and hw_report.gps.fix:
         gps_lat, gps_lon = hw_report.gps.lat, hw_report.gps.lon
 
@@ -136,16 +146,24 @@ def main(stdscr) -> None:
         elif ch == "1":
             _safe_dispatch(airplanes.run, stdscr, gps_lat, gps_lon)
         elif ch == "2":
-            _safe_dispatch(radio.run, stdscr)
+            _safe_dispatch(waterfall.run, stdscr)
         elif ch == "3":
-            _safe_dispatch(maritime.run, stdscr, gps_lat, gps_lon)
+            _safe_dispatch(radio.run, stdscr)
         elif ch == "4":
+            _safe_dispatch(maritime.run, stdscr, gps_lat, gps_lon)
+        elif ch == "5":
             _safe_dispatch(iss.run, stdscr, gps_lat, gps_lon)
+        elif ch == "6":
+            _safe_dispatch(sstv.run, stdscr)
+        elif ch == "7":
+            _safe_dispatch(morse.run, stdscr)
         # Re-check hardware occasionally in case devices were hot-plugged
         # while sitting at the menu (cheap enough to just redo each loop).
         hw_report = hardware.full_report()
         if hw_report.gps and hw_report.gps.fix:
             gps_lat, gps_lon = hw_report.gps.lat, hw_report.gps.lon
+        else:
+            gps_lat, gps_lon = None, None
 
 
 def _safe_dispatch(fn, *args) -> None:

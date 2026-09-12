@@ -44,9 +44,16 @@ apt-get install -y \
     pkg-config \
     gpsd \
     gpsd-clients \
+    sox \
+    libsox-fmt-all \
+    alsa-utils \
+    pulseaudio-utils \
+    multimon-ng \
     python3-pip \
     python3-dev \
     python3-numpy \
+    python3-scipy \
+    python3-sounddevice \
     build-essential \
     git \
     || true
