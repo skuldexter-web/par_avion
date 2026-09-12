@@ -1,249 +1,335 @@
 """
-radio.py — CLI spectrum waterfall analyzer for PAR AVION.
+radio.py — Broadcast AM/FM audio demodulator & tuner for PAR AVION.
 
-Reads raw IQ samples from an RTL-SDR via pyrtlsdr, computes an FFT power
-spectrum, and renders a scrolling ANSI-gradient waterfall (black -> blue ->
-cyan -> green -> yellow -> red) plus a live spectrum line. Supports live
-retuning with arrow keys across ISM, FM broadcast, airband, and HAM ranges.
+Tunes an RTL-SDR to a broadcast FM (88.0-108.0 MHz) or AM frequency and
+streams demodulated audio to the system's speakers by piping `rtl_fm`
+(part of the rtl-sdr package) into `sox`'s `play` command — the standard
+receive-only chain used throughout the SDR hobbyist community. This
+module does not transmit; it only tunes a receiver and plays back
+whatever audio the SDR demodulates.
 
-Receive-only: this reads whatever signal is already present at the
-antenna. It does not key up a transmitter.
+Requires: `rtl_fm` (from rtl-sdr) and `play` (from sox) on PATH — both
+installed by install.sh.
 """
 
 from __future__ import annotations
 
 import curses
-import time
+import shutil
+import subprocess
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-import numpy as np
-
-try:
-    from rtlsdr import RtlSdr
-    HAVE_RTLSDR = True
-except Exception:
-    # Broader than ImportError on purpose: pyrtlsdr raises AttributeError
-    # (or other errors) at import time if the installed librtlsdr.so is
-    # older/newer than what the Python bindings expect (missing symbols
-    # like rtlsdr_set_dithering). Either way, fall back to simulated mode
-    # rather than crashing the whole app.
-    RtlSdr = None
-    HAVE_RTLSDR = False
-
+from . import radar_ui
 
 # ---------------------------------------------------------------------------
-# Band presets: (name, center_freq_hz, sample_rate_hz)
+# Band limits and presets
 # ---------------------------------------------------------------------------
-BAND_PRESETS = [
-    ("433 MHz ISM", 433_100_000, 2_048_000),
-    ("FM Broadcast", 100_000_000, 2_400_000),
-    ("Airband (AM)", 124_000_000, 2_048_000),
-    ("2m HAM", 146_000_000, 2_048_000),
-    ("70cm HAM", 435_000_000, 2_048_000),
-    ("315 MHz ISM", 315_000_000, 2_048_000),
+FM_BAND_HZ = (88_000_000, 108_000_000)
+AM_BAND_HZ = (530_000, 1_700_000)
+
+FM_STEP_HZ = 200_000   # broadcast FM channel spacing (US); 100kHz elsewhere
+AM_STEP_HZ = 10_000    # broadcast AM channel spacing (US); 9kHz elsewhere
+FINE_STEP_HZ = 10_000
+
+PRESETS: List[Tuple[str, int, str]] = [
+    ("FM 88.5", 88_500_000, "fm"),
+    ("FM 94.9", 94_900_000, "fm"),
+    ("FM 101.1", 101_100_000, "fm"),
+    ("FM 107.9", 107_900_000, "fm"),
+    ("AM 1010", 1_010_000, "am"),
+    ("AM 1350", 1_350_000, "am"),
 ]
-
-TUNE_STEP_HZ = 100_000  # coarse step for left/right; shift for fine step
-TUNE_STEP_FINE_HZ = 10_000
-
-WATERFALL_GRADIENT = [
-    (curses.COLOR_BLACK, " "),
-    (curses.COLOR_BLUE, "░"),
-    (curses.COLOR_CYAN, "▒"),
-    (curses.COLOR_GREEN, "▓"),
-    (curses.COLOR_YELLOW, "█"),
-    (curses.COLOR_RED, "█"),
-]
-
-
-def init_gradient_colors(base_pair_start: int = 20) -> List[int]:
-    """Initialize a run of color pairs for the waterfall gradient."""
-    pairs = []
-    for i, (color, _) in enumerate(WATERFALL_GRADIENT):
-        pair_id = base_pair_start + i
-        try:
-            curses.init_pair(pair_id, color, curses.COLOR_BLACK)
-        except curses.error:
-            pass
-        pairs.append(pair_id)
-    return pairs
 
 
 @dataclass
 class TunerState:
-    band_index: int = 0
-    center_freq_hz: int = BAND_PRESETS[0][1]
-    sample_rate_hz: int = BAND_PRESETS[0][2]
-    gain: str = "auto"
+    mode: str = "fm"  # "fm" or "am"
+    freq_hz: int = 101_100_000
+    volume_pct: int = 70
+    squelch_db: int = 0  # 0 = squelch off
 
-    def apply_preset(self, index: int) -> None:
-        index = index % len(BAND_PRESETS)
-        _, freq, rate = BAND_PRESETS[index]
-        self.band_index = index
-        self.center_freq_hz = freq
-        self.sample_rate_hz = rate
+    def step_hz(self) -> int:
+        return FM_STEP_HZ if self.mode == "fm" else AM_STEP_HZ
+
+    def band_limits(self) -> Tuple[int, int]:
+        return FM_BAND_HZ if self.mode == "fm" else AM_BAND_HZ
 
     def nudge(self, delta_hz: int) -> None:
-        self.center_freq_hz = max(24_000_000, min(1_766_000_000, self.center_freq_hz + delta_hz))
+        lo, hi = self.band_limits()
+        self.freq_hz = max(lo, min(hi, self.freq_hz + delta_hz))
+
+    def toggle_mode(self) -> None:
+        # FM and AM occupy completely different frequency ranges (MHz vs
+        # kHz), so simply clamping freq_hz into the new band's limits
+        # would silently snap to whatever edge happens to be nearest in
+        # raw Hz terms (e.g. FM 101.1MHz -> AM 1700kHz, the AM band's
+        # max) rather than anything resembling a real station. Jump to
+        # the first preset for the new mode instead, which is always a
+        # real, useful frequency.
+        new_mode = "am" if self.mode == "fm" else "fm"
+        self.mode = new_mode
+        first_preset = next((p for p in PRESETS if p[2] == new_mode), None)
+        if first_preset is not None:
+            self.freq_hz = first_preset[1]
+        else:
+            lo, hi = self.band_limits()
+            self.freq_hz = max(lo, min(hi, self.freq_hz))
+
+    def apply_preset(self, index: int) -> None:
+        index = index % len(PRESETS)
+        _, freq, mode = PRESETS[index]
+        self.mode = mode
+        self.freq_hz = freq
 
 
-class SDRReader:
-    """Wraps pyrtlsdr; falls back to synthetic noise if no hardware present
-    so the UI remains testable/demoable without a dongle attached."""
+class AudioTunerController:
+    """
+    Manages the rtl_fm -> play subprocess pipeline. rtl_fm demodulates
+    FM/AM to a raw PCM stream on stdout; play (sox) reads that stream
+    and outputs it to the system's default audio device.
+    """
 
-    def __init__(self, tuner: TunerState):
-        self.tuner = tuner
-        self.sdr: Optional["RtlSdr"] = None
-        self.simulated = not HAVE_RTLSDR
-        if HAVE_RTLSDR:
-            try:
-                self.sdr = RtlSdr()
-                self._apply_tuning()
-            except Exception:
-                self.sdr = None
-                self.simulated = True
+    def __init__(self):
+        self.rtl_fm_proc: Optional[subprocess.Popen] = None
+        self.play_proc: Optional[subprocess.Popen] = None
+        self.last_error = ""
+        self.tools_available = self._check_tools()
 
-    def _apply_tuning(self) -> None:
-        if self.sdr is None:
-            return
-        self.sdr.sample_rate = self.tuner.sample_rate_hz
-        self.sdr.center_freq = self.tuner.center_freq_hz
-        self.sdr.gain = "auto" if self.tuner.gain == "auto" else float(self.tuner.gain)
+    @staticmethod
+    def _check_tools() -> bool:
+        return shutil.which("rtl_fm") is not None and shutil.which("play") is not None
 
-    def retune(self) -> None:
-        self._apply_tuning()
+    def missing_tools(self) -> List[str]:
+        missing = []
+        if shutil.which("rtl_fm") is None:
+            missing.append("rtl_fm (package: rtl-sdr)")
+        if shutil.which("play") is None:
+            missing.append("play (package: sox)")
+        return missing
 
-    def read_power_spectrum(self, n_bins: int) -> np.ndarray:
-        """Returns a normalized (0..1) power spectrum array of n_bins bins."""
-        if self.simulated or self.sdr is None:
-            return self._simulate_spectrum(n_bins)
+    def start(self, tuner: TunerState) -> bool:
+        self.stop()
+        if not self.tools_available:
+            self.last_error = "Missing tools: " + ", ".join(self.missing_tools())
+            return False
+
+        # rtl_fm demodulation mode: plain "fm" (not the "wbfm" shorthand)
+        # for broadcast FM, with de-emphasis explicitly enabled via
+        # -E deemp — de-emphasis undoes the treble boost FM broadcast
+        # transmitters apply before transmission, and without it audio
+        # sounds thin/harsh even though the frequency demodulation
+        # itself is otherwise correct. The "wbfm" shorthand documented
+        # by rtl_fm (-M fm -s 170k -o 4 -A fast -r 32k -l 0 -E deemp)
+        # already includes deemp, but bundles a fixed sample/output rate
+        # with it — using plain "fm" plus explicit flags keeps our own
+        # -s/-r choices unambiguous rather than depending on how rtl_fm's
+        # argument parser resolves a later flag against an earlier
+        # shorthand's implied value.
+        if tuner.mode == "fm":
+            demod_args = ["-M", "fm", "-s", "200000", "-r", "48000", "-E", "deemp"]
+        else:
+            demod_args = ["-M", "am", "-s", "48000", "-r", "48000"]
+
+        rtl_fm_cmd = [
+            "rtl_fm",
+            "-f", str(tuner.freq_hz),
+            *demod_args,
+        ]
+        if tuner.squelch_db != 0:
+            rtl_fm_cmd += ["-l", str(tuner.squelch_db)]
+
+        # play reads raw signed 16-bit little-endian PCM at 48kHz mono
+        # from stdin (matching rtl_fm's -r 48000 output) and adjusts
+        # volume via sox's vol effect (0.0-ish to 1.0+ multiplier).
+        vol_multiplier = max(0.0, min(2.0, tuner.volume_pct / 100.0))
+        play_cmd = [
+            "play", "-q", "-t", "raw", "-r", "48000", "-es", "-b", "16", "-c", "1",
+            "-", "vol", f"{vol_multiplier:.2f}",
+        ]
+
         try:
-            samples = self.sdr.read_samples(8 * 1024)
-            windowed = samples * np.hanning(len(samples))
-            spectrum = np.fft.fftshift(np.fft.fft(windowed))
-            power = 20 * np.log10(np.abs(spectrum) + 1e-9)
-            # Resample to n_bins
-            power = np.interp(
-                np.linspace(0, len(power) - 1, n_bins),
-                np.arange(len(power)),
-                power,
+            self.rtl_fm_proc = subprocess.Popen(
+                rtl_fm_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            power -= power.min()
-            if power.max() > 0:
-                power /= power.max()
-            return power
-        except Exception:
-            return self._simulate_spectrum(n_bins)
+            self.play_proc = subprocess.Popen(
+                play_cmd, stdin=self.rtl_fm_proc.stdout, stderr=subprocess.DEVNULL
+            )
+            # Allow rtl_fm_proc to receive SIGPIPE if play_proc exits, per
+            # the standard subprocess piping idiom.
+            if self.rtl_fm_proc.stdout:
+                self.rtl_fm_proc.stdout.close()
+            self.last_error = ""
+            return True
+        except FileNotFoundError as e:
+            self.last_error = f"Tool not found: {e}"
+            self.stop()
+            return False
+        except Exception as e:
+            self.last_error = f"Failed to start audio pipeline: {e}"
+            self.stop()
+            return False
 
-    def _simulate_spectrum(self, n_bins: int) -> np.ndarray:
-        """Synthetic noise floor + a couple of drifting fake carriers, used
-        only when no SDR hardware is connected, so the TUI still runs."""
-        t = time.time()
-        x = np.linspace(-1, 1, n_bins)
-        noise = np.random.normal(0.15, 0.05, n_bins)
-        carrier1 = 0.8 * np.exp(-((x - 0.3 * np.sin(t * 0.3)) ** 2) / 0.002)
-        carrier2 = 0.5 * np.exp(-((x + 0.5) ** 2) / 0.001)
-        spectrum = np.clip(noise + carrier1 + carrier2, 0, 1)
-        return spectrum
+    def is_running(self) -> bool:
+        return (
+            self.rtl_fm_proc is not None
+            and self.rtl_fm_proc.poll() is None
+            and self.play_proc is not None
+            and self.play_proc.poll() is None
+        )
 
-    def close(self) -> None:
-        if self.sdr is not None:
+    def check_died(self) -> Optional[str]:
+        """Returns an error string if either process died unexpectedly,
+        else None."""
+        if self.rtl_fm_proc is not None and self.rtl_fm_proc.poll() is not None:
+            stderr = ""
             try:
-                self.sdr.close()
+                if self.rtl_fm_proc.stderr:
+                    stderr = self.rtl_fm_proc.stderr.read().decode(errors="ignore")[:200]
             except Exception:
                 pass
+            return f"rtl_fm exited (code {self.rtl_fm_proc.returncode})" + (
+                f": {stderr}" if stderr else " — no SDR available?"
+            )
+        if self.play_proc is not None and self.play_proc.poll() is not None:
+            return f"play (sox) exited (code {self.play_proc.returncode}) — check audio output device"
+        return None
 
-
-def _power_to_gradient_index(value: float) -> int:
-    idx = int(value * (len(WATERFALL_GRADIENT) - 1))
-    return max(0, min(len(WATERFALL_GRADIENT) - 1, idx))
+    def stop(self) -> None:
+        for proc in (self.play_proc, self.rtl_fm_proc):
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        self.rtl_fm_proc = None
+        self.play_proc = None
 
 
 def run(stdscr) -> None:
+    """
+    Keys:
+      [Q] back to menu        [Space] play/pause (start/stop audio)
+      [<-]/[->] tune (channel step)   [Shift+<-]/[Shift+->] fine tune 10kHz
+      [Up]/[Down] cycle presets   [+]/[-] volume    [B] toggle FM/AM band
+    """
     curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.timeout(80)
-    curses.start_color()
-    curses.use_default_colors()
-    gradient_pairs = init_gradient_colors()
+    radar_ui.init_colors()
 
     tuner = TunerState()
-    tuner.apply_preset(0)
-    reader = SDRReader(tuner)
+    controller = AudioTunerController()
+    playing = False
 
     height, width = stdscr.getmaxyx()
-    header_h = 3
-    spectrum_h = 6
-    waterfall_h = height - header_h - spectrum_h - 1
-    n_bins = width - 2
 
-    waterfall_history: List[np.ndarray] = []
+    def _draw() -> None:
+        stdscr.erase()
+        died_reason = controller.check_died() if playing else None
+        currently_playing = playing and died_reason is None
+
+        try:
+            stdscr.addstr(0, 1, " PAR AVION — Radio / Broadcast Tuner ", curses.A_BOLD)
+
+            band_lo, band_hi = tuner.band_limits()
+            if tuner.mode == "fm":
+                freq_display = f"{tuner.freq_hz/1e6:.3f} MHz"
+                range_display = f"{band_lo/1e6:.1f}-{band_hi/1e6:.1f} MHz"
+            else:
+                freq_display = f"{tuner.freq_hz/1e3:.0f} kHz"
+                range_display = f"{band_lo/1e3:.0f}-{band_hi/1e3:.0f} kHz"
+
+            stdscr.addstr(2, 1, f" Band: {tuner.mode.upper()}   Freq: {freq_display}   Range: {range_display} ")
+            stdscr.addstr(3, 1, f" Volume: {tuner.volume_pct}%   "
+                                 f"Status: {'PLAYING' if currently_playing else 'STOPPED'} ")
+
+            if not controller.tools_available:
+                stdscr.addstr(5, 1, " Missing required tools:", curses.color_pair(radar_ui.PAIR_RED) | curses.A_BOLD)
+                for i, tool in enumerate(controller.missing_tools()):
+                    stdscr.addstr(6 + i, 3, f"- {tool}", curses.color_pair(radar_ui.PAIR_RED))
+                stdscr.addstr(6 + len(controller.missing_tools()) + 1, 1,
+                              " Run install.sh, or install manually.", curses.color_pair(radar_ui.PAIR_YELLOW))
+            elif died_reason:
+                stdscr.addstr(5, 1, f" Audio pipeline stopped: {died_reason[:width-3]}",
+                              curses.color_pair(radar_ui.PAIR_RED))
+
+            stdscr.addstr(8, 1, " Presets:", curses.A_UNDERLINE)
+            for i, (label, freq, mode) in enumerate(PRESETS):
+                marker = ">" if (mode == tuner.mode and freq == tuner.freq_hz) else " "
+                stdscr.addstr(9 + i, 3, f"{marker} {label}")
+
+            help_y = height - 3
+            stdscr.addstr(help_y, 1,
+                          " [Space] Play/Stop  [<-/->] Tune  [Shift+<-/->] Fine  ")
+            stdscr.addstr(help_y + 1, 1,
+                          " [Up/Down] Presets  [+/-] Volume  [B] FM/AM  [Q] Quit ")
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+    def _restart_if_playing() -> None:
+        nonlocal playing
+        if playing:
+            playing = controller.start(tuner)
+
+    stdscr.nodelay(True)
+    stdscr.timeout(200)
 
     try:
         while True:
+            _draw()
             key = stdscr.getch()
+
             if key in (ord("q"), ord("Q"), 27):
                 break
+            elif key == ord(" "):
+                if playing:
+                    controller.stop()
+                    playing = False
+                else:
+                    playing = controller.start(tuner)
             elif key == curses.KEY_LEFT:
-                tuner.nudge(-TUNE_STEP_HZ)
-                reader.retune()
+                tuner.nudge(-tuner.step_hz())
+                _restart_if_playing()
             elif key == curses.KEY_RIGHT:
-                tuner.nudge(TUNE_STEP_HZ)
-                reader.retune()
+                tuner.nudge(tuner.step_hz())
+                _restart_if_playing()
             elif key == curses.KEY_SLEFT:
-                tuner.nudge(-TUNE_STEP_FINE_HZ)
-                reader.retune()
+                tuner.nudge(-FINE_STEP_HZ)
+                _restart_if_playing()
             elif key == curses.KEY_SRIGHT:
-                tuner.nudge(TUNE_STEP_FINE_HZ)
-                reader.retune()
-            elif key in (curses.KEY_UP, curses.KEY_DOWN):
-                delta = 1 if key == curses.KEY_UP else -1
-                tuner.apply_preset(tuner.band_index + delta)
-                reader.retune()
+                tuner.nudge(FINE_STEP_HZ)
+                _restart_if_playing()
+            elif key == curses.KEY_UP:
+                current = next(
+                    (i for i, p in enumerate(PRESETS) if p[1] == tuner.freq_hz and p[2] == tuner.mode),
+                    -1,
+                )
+                tuner.apply_preset(current + 1)
+                _restart_if_playing()
+            elif key == curses.KEY_DOWN:
+                current = next(
+                    (i for i, p in enumerate(PRESETS) if p[1] == tuner.freq_hz and p[2] == tuner.mode),
+                    0,
+                )
+                tuner.apply_preset(current - 1)
+                _restart_if_playing()
+            elif key in (ord("+"), ord("=")):
+                tuner.volume_pct = min(150, tuner.volume_pct + 5)
+                _restart_if_playing()
+            elif key == ord("-"):
+                tuner.volume_pct = max(0, tuner.volume_pct - 5)
+                _restart_if_playing()
+            elif key in (ord("b"), ord("B")):
+                was_playing = playing
+                if was_playing:
+                    controller.stop()
+                tuner.toggle_mode()
+                if was_playing:
+                    playing = controller.start(tuner)
 
-            spectrum = reader.read_power_spectrum(n_bins)
-            waterfall_history.insert(0, spectrum)
-            if len(waterfall_history) > waterfall_h:
-                waterfall_history.pop()
-
-            stdscr.erase()
-
-            # Header
-            band_name = BAND_PRESETS[tuner.band_index][0]
-            mode_tag = "SIMULATED (no SDR detected)" if reader.simulated else "LIVE"
-            stdscr.addstr(0, 1, f" PAR AVION — Radio / Waterfall  [{mode_tag}] ",
-                          curses.A_BOLD)
-            stdscr.addstr(1, 1,
-                          f" Band: {band_name}   Freq: {tuner.center_freq_hz/1e6:.4f} MHz   "
-                          f"Rate: {tuner.sample_rate_hz/1e6:.3f} MSPS ")
-            stdscr.addstr(2, 1, " ←/→ tune 100kHz  Shift+←/→ tune 10kHz  ↑/↓ band preset  Q quit ")
-
-            # Spectrum line (bar chart)
-            for col in range(min(n_bins, spectrum.shape[0])):
-                bar_height = int(spectrum[col] * spectrum_h)
-                for row in range(bar_height):
-                    y = header_h + spectrum_h - 1 - row
-                    idx = _power_to_gradient_index(spectrum[col])
-                    try:
-                        stdscr.addch(y, col + 1, WATERFALL_GRADIENT[idx][1],
-                                     curses.color_pair(gradient_pairs[idx]))
-                    except curses.error:
-                        pass
-
-            # Waterfall (scrolling history, newest at top)
-            for row_i, row_spectrum in enumerate(waterfall_history):
-                y = header_h + spectrum_h + row_i
-                if y >= height - 1:
-                    break
-                for col in range(min(n_bins, row_spectrum.shape[0])):
-                    idx = _power_to_gradient_index(row_spectrum[col])
-                    try:
-                        stdscr.addch(y, col + 1, WATERFALL_GRADIENT[idx][1],
-                                     curses.color_pair(gradient_pairs[idx]))
-                    except curses.error:
-                        pass
-
-            stdscr.refresh()
+            if playing and controller.check_died():
+                playing = False
     finally:
-        reader.close()
+        controller.stop()

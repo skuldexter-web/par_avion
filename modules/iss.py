@@ -149,9 +149,17 @@ def _format_eta(target: Optional[datetime]) -> str:
     return f"{h:02d}h {m:02d}m"
 
 
-def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
+def run(stdscr, ref_lat: Optional[float] = None, ref_lon: Optional[float] = None) -> None:
+    """
+    ref_lat/ref_lon: pass None for either (or both) when no GPS fix is
+    available. Pass prediction is meaningless without a real observer
+    location, so this mode refuses to silently substitute (0,0) — which
+    is a real place (the Gulf of Guinea) that would otherwise produce a
+    plausible-looking but wrong "next pass" time for whoever's watching.
+    """
     curses.curs_set(0)
     radar_ui.init_colors()
+    gps_available = ref_lat is not None and ref_lon is not None
 
     height, width = stdscr.getmaxyx()
     globe_w = width // 2
@@ -169,8 +177,8 @@ def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
         status_win.refresh()
 
     _status_line(" Fetching ISS TLE from CelesTrak... ")
-    tracker = ISSTracker(observer_lat=ref_lat, observer_lon=ref_lon)
-    pass_pred = tracker.next_pass()
+    tracker = ISSTracker(observer_lat=ref_lat or 0.0, observer_lon=ref_lon or 0.0)
+    pass_pred = tracker.next_pass() if gps_available else PassPrediction()
     last_pass_check = time.time()
 
     stdscr.nodelay(True)
@@ -183,10 +191,11 @@ def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
         elif key == ord("r"):
             _status_line(" Refreshing TLE... ")
             tracker.refresh_tle()
-            pass_pred = tracker.next_pass()
+            if gps_available:
+                pass_pred = tracker.next_pass()
 
         # Periodically recompute the next pass (every 5 minutes)
-        if time.time() - last_pass_check > 300:
+        if gps_available and time.time() - last_pass_check > 300:
             pass_pred = tracker.next_pass()
             last_pass_check = time.time()
 
@@ -210,17 +219,24 @@ def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
             info_win.addstr(row, 2, f"Position unavailable ({reason})")
             row += 2
 
-        info_win.addstr(row, 2, "NEXT PASS (your location):",
-                         curses.A_UNDERLINE)
-        row += 1
-        info_win.addstr(row, 2, f"Rise:   {_format_eta(pass_pred.rise_time)}")
-        row += 1
-        info_win.addstr(row, 2, f"Peak:   {_format_eta(pass_pred.culminate_time)}"
-                                 + (f"  (max el {pass_pred.max_elevation_deg:.0f}°)"
-                                    if pass_pred.max_elevation_deg else ""))
-        row += 1
-        info_win.addstr(row, 2, f"Set:    {_format_eta(pass_pred.set_time)}")
-        row += 2
+        if not gps_available:
+            info_win.addstr(row, 2, "NEXT PASS: unavailable (no GPS fix)",
+                             curses.color_pair(radar_ui.PAIR_RED) | curses.A_UNDERLINE)
+            row += 1
+            info_win.addstr(row, 2, "Pass times depend on your location.")
+            row += 2
+        else:
+            info_win.addstr(row, 2, "NEXT PASS (your location):",
+                             curses.A_UNDERLINE)
+            row += 1
+            info_win.addstr(row, 2, f"Rise:   {_format_eta(pass_pred.rise_time)}")
+            row += 1
+            info_win.addstr(row, 2, f"Peak:   {_format_eta(pass_pred.culminate_time)}"
+                                     + (f"  (max el {pass_pred.max_elevation_deg:.0f}°)"
+                                        if pass_pred.max_elevation_deg else ""))
+            row += 1
+            info_win.addstr(row, 2, f"Set:    {_format_eta(pass_pred.set_time)}")
+            row += 2
 
         tle_age = "never fetched" if not tracker.tle else \
             f"{int((time.time() - tracker.tle.fetched_at) / 60)} min ago"

@@ -292,23 +292,42 @@ class AISTracker:
             return sorted(fresh, key=lambda v: v.last_seen, reverse=True)
 
 
-def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
-    """Keys: [Q] back to menu   [S] (re)start rtl_ais"""
+def run(stdscr, ref_lat: Optional[float] = None, ref_lon: Optional[float] = None) -> None:
+    """
+    Keys: [Q] back to menu   [S] (re)start rtl_ais
+
+    ref_lat/ref_lon: pass None for either (or both) when no GPS fix is
+    available — the radar falls back to relative spatial estimation with
+    a warning banner rather than treating (0,0) as a real position.
+    """
     curses.curs_set(0)
     radar_ui.init_colors()
+    gps_available = ref_lat is not None and ref_lon is not None
 
     height, width = stdscr.getmaxyx()
-    radar_h = height - 1
-    sweep = radar_ui.RadarSweep(radar_h, width // 2, radar_ui.PAIR_BLUE)
-    table = radar_ui.DataTable(
-        radar_h, width - width // 2,
-        headers=["MMSI", "NAME", "SOG", "COG", "DIST"],
-        col_widths=[10, 16, 7, 6, 8],
-    )
+    left_w = width // 2
+    right_w = width - left_w
+    main_h = height - 1  # leave the bottom row for the keybinding footer
 
-    radar_win = curses.newwin(radar_h, width // 2, 0, 0)
-    table_win = curses.newwin(radar_h, width - width // 2, 0, width // 2)
-    status_win = curses.newwin(1, width, height - 1, 0)
+    radar_win = curses.newwin(main_h, left_w, 0, 0)
+    table_win = curses.newwin(main_h, right_w, 0, left_w)
+    footer_win = curses.newwin(1, width, height - 1, 0)
+
+    sweep = radar_ui.RadarSweep(main_h, left_w, radar_ui.PAIR_BLUE, title="AIS RADAR SCOPE")
+    status_block_h = 6
+    table = radar_ui.DataTable(
+        main_h, right_w,
+        headers=["NAME", "SOG", "COG", "DIST"],
+        col_widths=[16, 8, 7, 8],
+        color_pair=radar_ui.PAIR_BLUE,
+        reserved_bottom_rows=status_block_h + 1,
+    )
+    status_y = main_h - status_block_h - 1
+    status_win = (
+        table_win.derwin(status_block_h, right_w - 4, status_y, 2)
+        if status_y > 0 else None
+    )
+    status_block = radar_ui.StatusBlock(status_block_h, right_w - 4, radar_ui.PAIR_BLUE)
 
     rtl_ais = RtlAisController()
     rtl_ais.ensure_running()  # best-effort; UDP listener starts regardless
@@ -317,18 +336,20 @@ def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
     tracker.start()  # listens on UDP:10110 regardless of who's sending to it
 
     def _restart_feed() -> None:
-        status_win.erase()
+        footer_win.erase()
         try:
-            status_win.addstr(0, 0, " Restarting rtl_ais... "[: width - 1],
+            footer_win.addstr(0, 0, " Restarting rtl_ais... "[: width - 1],
                                curses.color_pair(radar_ui.PAIR_YELLOW))
         except curses.error:
             pass
-        status_win.refresh()
+        footer_win.refresh()
         rtl_ais.shutdown()
         rtl_ais.spawn()
 
     stdscr.nodelay(True)
     stdscr.timeout(200)
+    update_interval_s = 10
+    last_interval_reset = time.time()
 
     try:
         while True:
@@ -341,46 +362,85 @@ def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
             sweep.tick()
             vessels = tracker.snapshot()
 
+            # Compute each vessel's distance/bearing once per frame and
+            # reuse it, rather than recomputing per use.
+            dist_bearing = {
+                v.mmsi: (v.distance_bearing_from(ref_lat, ref_lon) if gps_available else (None, None))
+                for v in vessels
+            }
+
+            # Dynamic max range: scale the scope to whatever the farthest
+            # current contact actually is (rounded up to a clean 10NM
+            # step, minimum 10NM), so vessels are spread across the
+            # visible rings rather than clipped/bunched at a fixed
+            # cutoff.
+            if gps_available and vessels:
+                real_dists = [d for d, _ in dist_bearing.values() if d is not None]
+                farthest = max(real_dists) if real_dists else 10.0
+                max_range_nm = max(10.0, math.ceil(farthest / 10.0) * 10.0)
+            else:
+                max_range_nm = 40.0
+
             contacts = []
             rows = []
             for v in vessels[:50]:
-                dist, bearing = v.distance_bearing_from(ref_lat, ref_lon)
-                if dist is not None:
+                dist, bearing = dist_bearing[v.mmsi]
+                if gps_available and dist is not None:
                     contacts.append(
                         radar_ui.RadarContact(
-                            range_frac=min(1.0, dist / 40.0),
+                            range_frac=min(1.0, dist / max_range_nm),
                             bearing_deg=bearing,
                             glyph="▲",
                             label=v.name or v.mmsi,
+                            distance_nm=dist,
+                        )
+                    )
+                elif not gps_available:
+                    contacts.append(
+                        radar_ui.RadarContact(
+                            range_frac=0.0,
+                            bearing_deg=0.0,
+                            glyph="▲",
+                            label=v.name or v.mmsi,
+                            distance_nm=None,
                         )
                     )
                 rows.append([
-                    v.mmsi,
-                    (v.name or "UNKNOWN")[:15],
-                    f"{v.sog_kt:.1f}kt" if v.sog_kt else "---",
-                    f"{v.cog_deg:.0f}" if v.cog_deg else "---",
-                    f"{dist:.1f}nm" if dist else "---",
+                    (v.name or v.mmsi)[:15],
+                    f"{v.sog_kt:.1f}" if v.sog_kt else "---",
+                    f"{v.cog_deg:.0f}\u00b0" if v.cog_deg else "---",
+                    f"{dist:.1f}" if dist else "---",
                 ])
 
-            sweep.draw(radar_win, contacts)
-            table.draw(table_win, rows, title="AIS Vessel Feed — 161.975/162.025MHz")
+            sweep.draw(radar_win, contacts, gps_available=gps_available,
+                       max_range_nm=max_range_nm)
+            table.draw(table_win, rows, title="VESSEL DATA")
 
-            status_win.erase()
-            if tracker.connected:
-                feed_status = "UDP:10110 LISTENING"
-                pair_color = radar_ui.PAIR_BLUE
-            else:
-                feed_status = tracker.last_error or "UDP bind failed — port in use?"
-                pair_color = radar_ui.PAIR_RED
+            if time.time() - last_interval_reset > update_interval_s:
+                last_interval_reset = time.time()
+            seconds_to_next = max(0, update_interval_s - int(time.time() - last_interval_reset))
+
+            feed_status = "ACTIVE" if tracker.connected else "NO FEED"
+
+            if status_win is not None:
+                status_block.draw(status_win, [
+                    ("STATUS", feed_status),
+                    ("CONTACTS", str(len(vessels))),
+                    ("RANGE", f"{max_range_nm:.0f}NM"),
+                    ("INTERVAL", f"{update_interval_s}S"),
+                    ("NEXT UPDATE", f"{seconds_to_next:02d}S"),
+                ])
+                table_win.noutrefresh()
+
+            footer_win.erase()
+            footer_text = " [Q] Quit  [S] Restart rtl_ais"
+            if not tracker.connected and tracker.last_error:
+                footer_text += f"  |  {tracker.last_error}"
             try:
-                status_win.addstr(
-                    0, 0,
-                    f" [Q] Quit  [S] Restart rtl_ais  |  {feed_status}  |  vessels: {len(vessels)}  "[: width - 1],
-                    curses.color_pair(pair_color),
-                )
+                footer_win.addstr(0, 0, footer_text[: width - 1], curses.color_pair(radar_ui.PAIR_BLUE))
             except curses.error:
                 pass
-            status_win.noutrefresh()
+            footer_win.noutrefresh()
             curses.doupdate()
     finally:
         tracker.stop()

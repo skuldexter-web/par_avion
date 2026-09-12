@@ -306,33 +306,47 @@ class AircraftTracker:
             return sorted(fresh, key=lambda a: a.last_seen, reverse=True)
 
 
-def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
+def run(stdscr, ref_lat: Optional[float] = None, ref_lon: Optional[float] = None) -> None:
     """
     Main loop for Airplanes mode. `stdscr` is the curses root window.
-    ref_lat/ref_lon should come from hardware.detect_gps(); caller passes
-    a fallback (e.g. 0,0) if no GPS fix is available.
+    ref_lat/ref_lon should come from hardware.detect_gps(); pass None for
+    either (or both) when no GPS fix is available — the radar will then
+    fall back to relative spatial estimation with a warning banner,
+    rather than silently treating (0,0) as a real position.
 
     Keys: [Q] back to menu   [S] (re)start dump1090
     """
     curses.curs_set(0)
     radar_ui.init_colors()
+    gps_available = ref_lat is not None and ref_lon is not None
 
     height, width = stdscr.getmaxyx()
     left_w = width // 2
     right_w = width - left_w
+    main_h = height - 1  # leave the bottom row for the keybinding footer
 
-    radar_win = curses.newwin(height - 1, left_w, 0, 0)
-    map_win = curses.newwin((height - 1) // 2, right_w, 0, left_w)
-    table_win = curses.newwin(height - 1 - (height - 1) // 2, right_w, (height - 1) // 2, left_w)
-    status_win = curses.newwin(1, width, height - 1, 0)
+    radar_win = curses.newwin(main_h, left_w, 0, 0)
+    table_win = curses.newwin(main_h, right_w, 0, left_w)
+    footer_win = curses.newwin(1, width, height - 1, 0)
 
-    sweep = radar_ui.RadarSweep(height - 1, left_w, radar_ui.PAIR_GREEN)
-    wmap = radar_ui.WorldMap((height - 1) // 2, right_w, radar_ui.PAIR_PURPLE)
+    sweep = radar_ui.RadarSweep(main_h, left_w, radar_ui.PAIR_GREEN, title="ADS-B RADAR SCOPE")
+    status_block_h = 6
     table = radar_ui.DataTable(
-        height - 1 - (height - 1) // 2, right_w,
-        headers=["ICAO", "CALL", "ALT", "SPD", "DIST", "HDG"],
-        col_widths=[8, 10, 8, 7, 8, 6],
+        main_h, right_w,
+        headers=["CALLSIGN", "ALT", "SPD", "DIST", "TRK"],
+        col_widths=[12, 8, 7, 8, 6],
+        color_pair=radar_ui.PAIR_GREEN,
+        reserved_bottom_rows=status_block_h + 1,
     )
+    # Status block lives inside the table panel's lower area, as a
+    # derived sub-window created once up front (not per-frame) so we're
+    # not allocating a new curses window object every draw.
+    status_y = main_h - status_block_h - 1
+    status_win = (
+        table_win.derwin(status_block_h, right_w - 4, status_y, 2)
+        if status_y > 0 else None
+    )
+    status_block = radar_ui.StatusBlock(status_block_h, right_w - 4, radar_ui.PAIR_GREEN)
 
     controller = Dump1090Controller()
     tracker: Optional[AircraftTracker] = None
@@ -341,12 +355,12 @@ def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
         """Draw an immediate one-line status message and flush it, used
         while a blocking action (like spawning dump1090) is in progress
         so the terminal doesn't appear to hang."""
-        status_win.erase()
+        footer_win.erase()
         try:
-            status_win.addstr(0, 0, text[: width - 1], curses.color_pair(radar_ui.PAIR_YELLOW))
+            footer_win.addstr(0, 0, text[: width - 1], curses.color_pair(radar_ui.PAIR_YELLOW))
         except curses.error:
             pass
-        status_win.refresh()
+        footer_win.refresh()
 
     def _try_connect() -> None:
         nonlocal tracker
@@ -368,6 +382,11 @@ def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
 
     stdscr.nodelay(True)
     stdscr.timeout(150)
+    update_interval_s = 10  # cosmetic — matches the reference scope's
+    # "next update" countdown; the actual feed updates continuously, this
+    # just paces how often the status block's countdown resets, purely
+    # for the tactical-scope look.
+    last_interval_reset = time.time()
 
     try:
         while True:
@@ -387,58 +406,97 @@ def run(stdscr, ref_lat: float = 0.0, ref_lon: float = 0.0) -> None:
             sweep.tick()
             aircraft = tracker.snapshot() if tracker is not None else []
 
+            # Compute each aircraft's distance/bearing once per frame and
+            # reuse it below, rather than recomputing (Haversine isn't
+            # free, and this list is walked more than once: once to find
+            # the farthest contact for auto-ranging, once to plot).
+            dist_bearing = {
+                ac.icao: (ac.distance_bearing_from(ref_lat, ref_lon) if gps_available else (None, None))
+                for ac in aircraft
+            }
+
+            # Dynamic max range: scale the scope to whatever the farthest
+            # current contact actually is (rounded up to a clean 20NM
+            # step, minimum 20NM), so contacts are spread across the
+            # visible rings rather than clipped/bunched at a fixed
+            # cutoff. Falls back to a sensible default with no contacts.
+            if gps_available and aircraft:
+                real_dists = [d for d, _ in dist_bearing.values() if d is not None]
+                farthest = max(real_dists) if real_dists else 20.0
+                max_range_nm = max(20.0, math.ceil(farthest / 20.0) * 20.0)
+            else:
+                max_range_nm = 60.0
+
             contacts = []
             rows = []
             for ac in aircraft[:50]:
-                dist, bearing = ac.distance_bearing_from(ref_lat, ref_lon)
-                if dist is not None:
+                dist, bearing = dist_bearing[ac.icao]
+                if gps_available and dist is not None:
                     contacts.append(
                         radar_ui.RadarContact(
-                            range_frac=min(1.0, dist / 150.0),
+                            range_frac=min(1.0, dist / max_range_nm),
                             bearing_deg=bearing,
                             glyph="✈",
                             label=ac.callsign or ac.icao,
+                            distance_nm=dist,
+                        )
+                    )
+                elif not gps_available:
+                    # Still show it on the (randomly-placed) radar and in
+                    # the contact list, just without real distance/bearing.
+                    contacts.append(
+                        radar_ui.RadarContact(
+                            range_frac=0.0,
+                            bearing_deg=0.0,
+                            glyph="✈",
+                            label=ac.callsign or ac.icao,
+                            distance_nm=None,
                         )
                     )
                 rows.append([
-                    ac.icao,
-                    ac.callsign or "----",
+                    ac.callsign or ac.icao,
                     str(ac.altitude_ft) if ac.altitude_ft else "----",
                     f"{ac.speed_kt:.0f}" if ac.speed_kt else "---",
-                    f"{dist:.0f}nm" if dist else "---",
-                    f"{bearing:.0f}" if bearing else "---",
+                    f"{dist:.1f}" if dist else "---",
+                    f"{bearing:.0f}\u00b0" if bearing else "---",
                 ])
 
-            sweep.draw(radar_win, contacts)
+            sweep.draw(radar_win, contacts, gps_available=gps_available,
+                       max_range_nm=max_range_nm)
 
-            markers = [
-                (ac.lat, ac.lon, "✈", ac.callsign or ac.icao)
-                for ac in aircraft if ac.lat is not None and ac.lon is not None
-            ]
-            wmap.draw(map_win, markers)
-            table.draw(table_win, rows, title="Live Feed — ADS-B 1090MHz")
+            table.draw(table_win, rows, title="AIRCRAFT DATA")
 
-            status_win.erase()
+            if time.time() - last_interval_reset > update_interval_s:
+                last_interval_reset = time.time()
+            seconds_to_next = max(0, update_interval_s - int(time.time() - last_interval_reset))
+
             if tracker is not None and tracker.connected:
-                conn_status = "CONNECTED"
-                if controller.owns_process:
-                    conn_status += f" (launched {controller.launched_binary})"
-                pair_color = radar_ui.PAIR_GREEN
+                conn_status = "ACTIVE"
             elif tracker is not None:
-                conn_status = "LINK LOST — retrying..."
-                pair_color = radar_ui.PAIR_YELLOW
+                conn_status = "LINK LOST"
             else:
-                conn_status = f"NOT RUNNING — {controller.last_error or 'press S to start dump1090'}"
-                pair_color = radar_ui.PAIR_RED
+                conn_status = "NOT RUNNING"
+
+            if status_win is not None:
+                status_block.draw(status_win, [
+                    ("STATUS", conn_status),
+                    ("CONTACTS", str(len(aircraft))),
+                    ("RANGE", f"{max_range_nm:.0f}NM"),
+                    ("INTERVAL", f"{update_interval_s}S"),
+                    ("NEXT UPDATE", f"{seconds_to_next:02d}S"),
+                ])
+                table_win.noutrefresh()
+
+            footer_win.erase()
+            controller_note = f" (launched {controller.launched_binary})" if controller.owns_process else ""
+            footer_text = f" [Q] Quit  [S] Start/Restart dump1090{controller_note}"
+            if tracker is None and controller.last_error:
+                footer_text += f"  |  {controller.last_error}"
             try:
-                status_win.addstr(
-                    0, 0,
-                    f" [Q] Quit  [S] Start/Restart dump1090  |  {conn_status}  |  tracked: {len(aircraft)}  "[: width - 1],
-                    curses.color_pair(pair_color),
-                )
+                footer_win.addstr(0, 0, footer_text[: width - 1], curses.color_pair(radar_ui.PAIR_GREEN))
             except curses.error:
                 pass
-            status_win.noutrefresh()
+            footer_win.noutrefresh()
 
             curses.doupdate()
     finally:
